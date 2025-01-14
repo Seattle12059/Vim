@@ -15,13 +15,16 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
-from models_mamba import vim_tiny_patch16_224_bimambav2_final_pool_mean_abs_pos_embed_with_midclstok_div2
+from models_mamba import vim_small_patch16_224_bimambav2_final_pool_mean_abs_pos_embed_with_midclstok_div2
 
 # 数据预处理
 transform = transforms.Compose([
-    transforms.Resize((224, 224)),  # 调整图像大小
-    transforms.ToTensor(),          # 转换为Tensor
-    transforms.Normalize(           # 归一化
+    transforms.RandomResizedCrop(224),  # 随机裁剪并调整大小
+    transforms.RandomHorizontalFlip(),  # 随机水平翻转
+    transforms.RandomRotation(15),      # 随机旋转
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),  # 颜色抖动
+    transforms.ToTensor(),              # 转换为Tensor
+    transforms.Normalize(               # 归一化
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225]
     )
@@ -94,7 +97,7 @@ val_loader = DataLoader(
 pretrained_path = 'Vim-small-midclstok/vim_s_midclstok_ft_81p6acc.pth'  # 使用微调后的预训练模型
 
 # 初始化模型并加载预训练权重
-model = vim_tiny_patch16_224_bimambav2_final_pool_mean_abs_pos_embed_with_midclstok_div2(
+model = vim_small_patch16_224_bimambav2_final_pool_mean_abs_pos_embed_with_midclstok_div2(
     num_classes=2  # crack500是二分类问题
 )
 # 加载预训练权重
@@ -106,15 +109,45 @@ model = model.to(device)
 
 # 定义损失函数和优化器
 criterion = nn.CrossEntropyLoss()
-# 使用较小的学习率进行微调
-optimizer = optim.AdamW(model.parameters(), lr=1e-5)
+# 使用较大的学习率进行微调
+optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+
+# 添加Cosine学习率调度器
+from torch.optim.lr_scheduler import CosineAnnealingLR
+scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+
+# 早停机制
+class EarlyStopping:
+    def __init__(self, patience=5, delta=0):
+        self.patience = patience
+        self.delta = delta
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+
+    def __call__(self, val_acc):
+        score = val_acc
+        if self.best_score is None:
+            self.best_score = score
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.counter = 0
 
 # 训练参数
 num_epochs = 20  # 微调时epoch数可以适当减少
 best_val_acc = 0.0
 
+# 初始化早停
+early_stopping = EarlyStopping(patience=5, delta=0.5)
+
 # 训练循环
 for epoch in range(num_epochs):
+    # 更新学习率
+    scheduler.step()
     model.train()
     running_loss = 0.0
     
@@ -155,6 +188,12 @@ for epoch in range(num_epochs):
           f'Loss: {running_loss/len(train_loader):.4f}, '
           f'Val Acc: {val_acc:.2f}%')
     
+    # 早停检查
+    early_stopping(val_acc)
+    if early_stopping.early_stop:
+        print("Early stopping triggered")
+        break
+        
     # 保存最佳模型
     if val_acc > best_val_acc:
         best_val_acc = val_acc
