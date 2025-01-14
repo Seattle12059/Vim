@@ -16,3 +16,5 @@ reference/
 causal-conv1d/
 work_dirs/
 __pycache__/
+/crack500/
+/crack500.zip
