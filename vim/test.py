@@ -1,109 +1,136 @@
 import torch
 import torch.nn as nn
-import torchvision.models as models
-from timm.models.vision_transformer import VisionTransformer, _cfg
-from timm.models.registry import register_model
+from torchvision import models
+from PIL import Image
+import numpy as np
+
+class PatchExtractor:
+    def __init__(self, img, patch_size, stride, noIP=False):
+        # 如果输入是 numpy 数组，转换为 PIL 图像
+        if type(img) == np.ndarray:
+            img = Image.fromarray(img)
+
+        # 如果 stride 不是元组或列表，转换为元组
+        if type(stride) not in (tuple, list):
+            stride = (stride, stride)
+
+        # 处理 stride，确保有四层的 stride
+        stride = np.array(stride).squeeze()
+        if len(stride.shape) == 1:
+            stride = np.expand_dims(stride, 0).repeat(4, axis=0)  # 改为 4 层
+
+        # 原始图像
+        self.img0 = img
+
+        # 如果不使用图像金字塔（noIP=True），则只使用原始图像
+        if noIP:
+            self.img_list = [self.img0]
+        else:
+            # 将图像缩放到 600x600、300x300 和 900x600
+            self.img1 = img.resize((600, 600), Image.BILINEAR)
+            self.img2 = img.resize((300, 300), Image.BILINEAR)
+            self.img3 = img.resize((900, 600), Image.BILINEAR)
+            # 图像列表，包含四种尺寸的图像
+            self.img_list = [self.img0, self.img1, self.img2, self.img3]
+
+        # patch 的大小
+        self.size = patch_size
+        # 每层图像的 stride
+        self.stride = stride
+
+    # 提取单个 patch
+    def extract_patch(self, img, patch, stride):
+        # 使用 PIL 的 crop 方法提取 patch
+        return img.crop((
+            patch[0] * stride[0],  # 左边界
+            patch[1] * stride[1],  # 上边界
+            patch[0] * stride[0] + self.size,  # 右边界
+            patch[1] * stride[1] + self.size  # 下边界
+        ))
+
+    # 计算当前层图像的 patch 数量
+    def shape(self, img, stride):
+        # 计算宽度方向的 patch 数量
+        wp = int((img.width - self.size) / stride[1] + 1)
+        # 计算高度方向的 patch 数量
+        hp = int((img.height - self.size) / stride[0] + 1)
+        return wp, hp
+
+    # 提取所有 patches
+    def extract_patches(self):
+        patches = []
+        # 遍历每层图像及其对应的 stride
+        for im, stride in zip(self.img_list, self.stride):
+            # 计算当前层图像的 patch 数量
+            wp, hp = self.shape(im, stride)
+            # 提取当前层图像的所有 patches
+            temp = [self.extract_patch(im, (w, h), stride) for h in range(hp) for w in range(wp)]
+            patches.extend(temp)
+        return patches
 
 
-class EfficientNetPatchEmbed(nn.Module):
+class PatchEmbed(nn.Module):
+    """ 2D Image to Patch Embedding with EfficientNetB3
     """
-    使用 EfficientNet-B3 作为 patch_embed 的生成器。
-    将 EfficientNet-B3 提取的 1536 维特征映射到目标维度 384。
-    """
 
-    def __init__(self, embed_dim=384):
+    def __init__(self, img_size=224, patch_size=16, stride=16, in_chans=3, embed_dim=768, norm_layer=None, flatten=True):
         super().__init__()
-        # 加载预训练的 EfficientNet-B3 模型
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.stride = stride
+        self.flatten = flatten
+
+        # Initialize EfficientNetB3 for feature extraction
         self.efficientnet = models.efficientnet_b3(pretrained=True)
+        self.efficientnet.classifier = nn.Identity()  # Remove the final classification layer
 
-        # 移除最后的分类层，保留特征提取部分
-        self.efficientnet = nn.Sequential(*list(self.efficientnet.children())[:-1])
-
-        # 添加一个线性层，将 1536 维特征映射到目标维度 384
-        self.proj = nn.Linear(1536, embed_dim)
-
-        # 归一化层
-        self.norm = nn.LayerNorm(embed_dim)
+        # Projection layer to match the desired embed_dim
+        self.proj = nn.Linear(1536, embed_dim)  # EfficientNetB3 output is 1536-dimensional
+        self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
     def forward(self, x):
-        """
-        前向传播：
-        1. 使用 EfficientNet-B3 提取特征。
-        2. 将特征从 1536 维映射到 384 维。
-        3. 应用归一化。
-        """
-        # 提取特征 (B, 1536, 1, 1)
-        with torch.no_grad():
-            features = self.efficientnet(x)
+        B, C, H, W = x.shape
+        assert H == self.img_size[0] and W == self.img_size[1], \
+            f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
 
-        # 全局平均池化 (B, 1536, 1, 1) -> (B, 1536)
-        features = torch.mean(features, dim=(2, 3))
+        # Convert tensor to PIL images for patch extraction
+        patches = []
+        for img in x:
+            img_np = img.permute(1, 2, 0).cpu().numpy()  # Convert to HWC format
+            img_pil = Image.fromarray((img_np * 255).astype(np.uint8))
+            patch_extractor = PatchExtractor(img_pil, self.patch_size, self.stride, noIP=True)
+            patches.append(patch_extractor.extract_patches())
 
-        # 映射到目标维度 (B, 1536) -> (B, 384)
-        features = self.proj(features)
+        # Convert patches to tensor and extract features using EfficientNetB3
+        patch_features = []
+        for batch_patches in patches:
+            batch_features = []
+            for patch in batch_patches:
+                patch_tensor = torch.tensor(np.array(patch) / 255.0, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)  # Convert to CHW format
+                patch_tensor = patch_tensor.to(x.device)
+                features = self.efficientnet(patch_tensor)
+                features = self.proj(features)
+                batch_features.append(features)
+            patch_features.append(torch.stack(batch_features))
 
-        # 归一化
-        features = self.norm(features)
+        # Stack all batch features
+        patch_features = torch.stack(patch_features)  # Shape: (B, N of patches, m dims of features)
 
-        # 调整形状为 (B, 1, 384)，模拟 patch_embed 的输出
-        features = features.unsqueeze(1)
-        return features
+        if self.flatten:
+            patch_features = patch_features.flatten(2).transpose(1, 2)  # BCHW -> BNC
 
-
-class VisionMambaWithEfficientNet(nn.Module):
-    """
-    修改后的 VisionMamba 模型，使用 EfficientNet-B3 作为 patch_embed 的生成器。
-    """
-
-    def __init__(self, **kwargs):
-        super().__init__()
-
-        # 使用 EfficientNetPatchEmbed 替换原始的 PatchEmbed
-        self.patch_embed = EfficientNetPatchEmbed(embed_dim=384)
-
-        # 加载预训练的 vim_small_patch16_224 模型
-        self.vim_model = vim_small_patch16_224_bimambav2_final_pool_mean_abs_pos_embed_with_midclstok_div2(
-            pretrained=True)
-
-        # 冻结 vim_small_patch16_224 的参数（可选）
-        for param in self.vim_model.parameters():
-            param.requires_grad = False
-
-    def forward(self, x):
-        """
-        前向传播：
-        1. 使用 EfficientNet-B3 提取特征并映射到 384 维。
-        2. 将特征输入到 vim_small_patch16_224 模型中。
-        """
-        # 提取特征 (B, 1, 384)
-        patch_embed = self.patch_embed(x)
-
-        # 输入到 vim_small_patch16_224 模型中
-        output = self.vim_model.forward_features(patch_embed)
-        return output
+        patch_features = self.norm(patch_features)
+        return patch_features
 
 
-@register_model
-def vim_small_patch16_224_new(pretrained=False, **kwargs):
-    """
-    注册新的模型 vim_small_patch16_224_new。
-    """
-    model = VisionMambaWithEfficientNet(**kwargs)
-    model.default_cfg = _cfg()
-    return model
-
-
-# 示例用法
 if __name__ == "__main__":
-    # 创建模型实例
-    model = vim_small_patch16_224_new(pretrained=True)
-    model.eval()
+    # Example usage
+    # Create a random input tensor (batch size = 2, channels = 3, height = 224, width = 224)
+    x = torch.randn(2, 3, 224, 224)
 
-    # 示例输入 (B, C, H, W)
-    patch = torch.randn(1, 3, 300, 300)
+    # Initialize the PatchEmbed model
+    model = PatchEmbed(img_size=300, patch_size=16, stride=16, embed_dim=768)
 
-    # 前向传播
-    with torch.no_grad():
-        output = model(patch)
-
-    print(output.shape)  # 输出特征维度
+    # Forward pass
+    output = model(x)
+    print("Output shape:", output.shape)  # Expected shape: (2, N of patches, 768)
